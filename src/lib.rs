@@ -396,23 +396,24 @@ pub fn decode_file<P: AsRef<Path>, Q: AsRef<Path>>(input_path: P, output_path: Q
     let input_path = input_path.as_ref();
     let output_path = output_path.as_ref();
 
-    // Step 1: open input and read the length prefix
     let mut input = File::open(input_path)?;
     let mut len_buf = [0u8; 8];
     input.read_exact(&mut len_buf)?;
     let expected = u64::from_le_bytes(len_buf);
 
-    // Step 2: initialize decoder and model
     let mut decoder = RangeDecoder::new(input)?;
     let mut model = PpmModel::new(DEFAULT_ORDER)?;
     let mut history = Vec::new();
     let mut writer = BufWriter::new(File::create(output_path)?);
 
-    // Step 3: decode exactly `expected` bytes
     let mut buf = [0u8; 1];
-    for _ in 0..expected {
+    let mut actual = 0;
+    while actual < expected {
+        println!("decoding byte {}/{}", actual, expected);
         model.decode_symbol(&mut decoder, &mut history, &mut buf)?;
+        println!("decoded {:02x}", buf[0]);
         writer.write_all(&buf)?;
+        actual += 1;
     }
 
     Ok(())
