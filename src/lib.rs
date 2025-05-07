@@ -1,7 +1,10 @@
-use std::collections::HashMap;
-use std::convert::AsRef;
-use std::io::{self, Read, Write};
-use std::path::Path;
+use std::{
+    collections::HashMap,
+    convert::AsRef,
+    fs::File,
+    io::{self, Read, Write},
+    path::Path,
+};
 use thiserror::Error as ThisError;
 
 const TOP: u32 = 1 << 24;
@@ -349,16 +352,16 @@ pub fn encode_file<P: AsRef<Path>, Q: AsRef<Path>>(
     output_path: Q,
     max_order: Option<u8>,
 ) -> PpmResult<()> {
-    let input = std::fs::File::open(input_path)?;
-    let output = std::fs::File::create(output_path)?;
+    let input = File::open(input_path)?;
+    let output = File::create(output_path)?;
     let mut model = PpmModel::new(max_order.unwrap_or(DEFAULT_ORDER))?;
     model.encode(input, output)?;
     Ok(())
 }
 
 pub fn decode_file<P: AsRef<Path>, Q: AsRef<Path>>(input_path: P, output_path: Q) -> PpmResult<()> {
-    let input = std::fs::File::open(input_path)?;
-    let output = std::fs::File::create(output_path)?;
+    let input = File::open(input_path)?;
+    let output = File::create(output_path)?;
     let mut decoder = RangeDecoder::new(input)?;
     let mut model = PpmModel::new(DEFAULT_ORDER)?;
     let mut output_writer = std::io::BufWriter::new(output);
