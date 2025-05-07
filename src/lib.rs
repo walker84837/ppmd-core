@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::convert::AsRef;
-use std::io::{self, Read, Write};
+use std::fs::File;
+use std::io::{self, BufWriter, Read, Write};
 use std::path::Path;
 use thiserror::Error as ThisError;
 
@@ -363,35 +364,56 @@ impl PpmModel {
 
 // File‐based convenience wrappers:
 
-/// Compress `input_path` → `output_path`, optional max_order (default 5)
 pub fn encode_file<P: AsRef<Path>, Q: AsRef<Path>>(
     input_path: P,
     output_path: Q,
-    max_order: Option<u8>,
+    max_order: Option<usize>,
 ) -> PpmResult<()> {
-    let input = std::fs::File::open(input_path)?;
-    let output = std::fs::File::create(output_path)?;
-    let mut model = PpmModel::new(max_order.unwrap_or(DEFAULT_ORDER))?;
-    model.encode(input, output)?;
+    let input_path = input_path.as_ref();
+    let output_path = output_path.as_ref();
+
+    // Step 1: determine original input length
+    let input_file = File::open(input_path)?;
+    let input_len = input_file.metadata()?.len();
+
+    // Step 2: open output and write length prefix
+    let mut output = File::create(output_path)?;
+    output.write_all(&input_len.to_le_bytes())?;
+
+    // Step 3: re-open input for reading (we already used it for metadata)
+    let mut input = File::open(input_path)?;
+
+    // Step 4: encode using PPM
+    let order = max_order.unwrap_or(DEFAULT_ORDER as usize);
+    let mut model = PpmModel::new(order.try_into().unwrap())?;
+    model.encode(&mut input, &mut output)?;
+
     Ok(())
 }
 
 /// Decompress `input_path` → `output_path`, using default order 5
 pub fn decode_file<P: AsRef<Path>, Q: AsRef<Path>>(input_path: P, output_path: Q) -> PpmResult<()> {
-    let input = std::fs::File::open(input_path)?;
-    let output = std::fs::File::create(output_path)?;
+    let input_path = input_path.as_ref();
+    let output_path = output_path.as_ref();
+
+    // Step 1: open input and read the length prefix
+    let mut input = File::open(input_path)?;
+    let mut len_buf = [0u8; 8];
+    input.read_exact(&mut len_buf)?;
+    let expected = u64::from_le_bytes(len_buf);
+
+    // Step 2: initialize decoder and model
     let mut decoder = RangeDecoder::new(input)?;
     let mut model = PpmModel::new(DEFAULT_ORDER)?;
     let mut history = Vec::new();
-    let mut writer = std::io::BufWriter::new(output);
-    let mut buf = [0u8; 1];
+    let mut writer = BufWriter::new(File::create(output_path)?);
 
-    loop {
-        match model.decode_symbol(&mut decoder, &mut history, &mut buf) {
-            Ok(()) => writer.write_all(&buf)?,
-            Err(PpmError::CorruptData) => break,
-            Err(e) => return Err(e),
-        }
+    // Step 3: decode exactly `expected` bytes
+    let mut buf = [0u8; 1];
+    for _ in 0..expected {
+        model.decode_symbol(&mut decoder, &mut history, &mut buf)?;
+        writer.write_all(&buf)?;
     }
+
     Ok(())
 }
