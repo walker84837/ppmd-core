@@ -162,7 +162,7 @@ impl PpmContext {
     }
 
     fn init(&mut self) {
-        if self.order == 1 {
+        if self.order == 0 {
             for symbol in 0..=255 {
                 self.stats.push(State {
                     symbol: symbol as u8,
@@ -206,7 +206,7 @@ impl PpmModel {
             current_order: 0,
         };
 
-        let mut ctx = PpmContext::new(1);
+        let mut ctx = PpmContext::new(0);
         ctx.init();
         model.contexts.insert(Vec::new(), ctx);
 
@@ -223,7 +223,7 @@ impl PpmModel {
             let mut cum_freq = 0;
             let mut found = false;
 
-            for order in (1..=self.current_order.min(history.len() as u8)).rev() {
+            for order in (1..=self.max_order.min(history.len() as u8)).rev() {
                 let ctx_key = history[history.len() - order as usize..].to_vec();
                 if let Some(ctx) = self.contexts.get_mut(&ctx_key) {
                     if let Some(state) = ctx.find_symbol(symbol) {
@@ -257,7 +257,7 @@ impl PpmModel {
         let mut found = false;
         let mut symbol = 0u8;
 
-        for order in (1..=self.current_order.min(history.len() as u8)).rev() {
+        for order in (1..=self.max_order.min(history.len() as u8)).rev() {
             let ctx_key = history[history.len() - order as usize..].to_vec();
             if let Some(ctx) = self.contexts.get(&ctx_key) {
                 let tot_freq = ctx.total_freq;
