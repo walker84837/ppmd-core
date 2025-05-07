@@ -41,6 +41,7 @@ impl<W: Write> RangeEncoder<W> {
     }
 
     fn encode(&mut self, cum_freq: u32, freq: u32, tot_freq: u32) -> PpmResult<()> {
+        // tot_freq is now guaranteed > 0
         self.range /= tot_freq;
         self.low = self.low.wrapping_add(cum_freq * self.range);
         self.range = self.range.wrapping_mul(freq);
@@ -96,7 +97,8 @@ impl<R: Read> RangeDecoder<R> {
     }
 
     pub fn get_freq(&mut self, tot_freq: u32) -> PpmResult<u32> {
-        self.range = self.range.wrapping_div(tot_freq);
+        // tot_freq > 0
+        self.range /= tot_freq;
         let tmp = (self.code.wrapping_sub(self.low)) / self.range;
         if tmp >= tot_freq {
             return Err(PpmError::CorruptData);
@@ -143,8 +145,10 @@ impl PpmContext {
         }
     }
 
-    /// Information inheritance from parent context (PPMII).
+    /// PPMII “information inheritance”:
+    /// copy each parent frequency as max(1, parent.freq/2)
     fn inherit_from(&mut self, parent: &PpmContext) {
+        self.stats.clear();
         for st in &parent.stats {
             self.stats.push(State {
                 symbol: st.symbol,
@@ -154,14 +158,14 @@ impl PpmContext {
         self.total_freq = self.stats.iter().map(|s| s.freq as u32).sum();
     }
 
-    /// Compute PPMD‐style frequencies:
-    ///   - existing symbol: f = 2·c − 1
-    ///   - escape:        esc = q
-    ///   - total:         tot = 2·C
+    /// PPMD escape probabilities:
+    ///   symbol fᵢ = 2·cᵢ − 1
+    ///   escape = q  (number of distinct symbols)
+    ///   tot    = 2·C
     fn get_cumulative(&self) -> (Vec<u8>, Vec<u32>, u32, u32) {
-        let c: u32 = self.stats.iter().map(|s| s.freq as u32).sum();
+        let C: u32 = self.stats.iter().map(|s| s.freq as u32).sum();
         let q = self.stats.len() as u32;
-        let tot = 2 * c;
+        let tot = 2 * C;
         let mut syms = Vec::with_capacity(self.stats.len());
         let mut freqs = Vec::with_capacity(self.stats.len());
         for st in &self.stats {
@@ -171,7 +175,8 @@ impl PpmContext {
         (syms, freqs, q, tot)
     }
 
-    /// Lazy‐exclusion update: only bump the highest‐order context that contains the symbol.
+    /// Lazy exclusion: bump only the first (highest-order) context
+    /// that actually contained the symbol.
     fn update_exclusion(&mut self, symbol: u8) {
         if let Some(st) = self.stats.iter_mut().find(|s| s.symbol == symbol) {
             st.freq = st.freq.saturating_add(1).min(MAX_FREQ);
@@ -194,7 +199,7 @@ impl PpmModel {
             max_order,
             contexts: HashMap::new(),
         };
-        // root (order -1) context = uniform order-0
+        // build the order−1 root context with uniform order‑0 stats
         let mut root = PpmContext::new();
         for sym in 0u8..=255 {
             root.stats.push(State {
@@ -207,11 +212,12 @@ impl PpmModel {
         Ok(m)
     }
 
-    /// Encode an entire stream.
+    /// Encode the entire input → output
     pub fn encode<R: Read, W: Write>(&mut self, mut input: R, output: W) -> PpmResult<W> {
         let mut encoder = RangeEncoder::new(output);
         let mut history = Vec::new();
         let mut buf = [0u8; 1];
+
         while input.read(&mut buf)? > 0 {
             let sym = buf[0];
             self.encode_symbol(&mut encoder, &history, sym)?;
@@ -226,82 +232,91 @@ impl PpmModel {
         history: &[u8],
         symbol: u8,
     ) -> PpmResult<()> {
-        // back off from highest ∙order to order -1
+        // back‑off from highest order down to order−1:
         for order in (1..=self.max_order.min(history.len() as u8)).rev() {
             let key = history[history.len() - order as usize..].to_vec();
             if let Some(ctx) = self.contexts.get(&key) {
                 let (syms, freqs, esc, tot) = ctx.get_cumulative();
-                // find if symbol is in this context
                 let mut cum = 0;
+                // if symbol found in this context, emit it
                 for (i, &s) in syms.iter().enumerate() {
                     if s == symbol {
-                        let f = freqs[i];
-                        return encoder.encode(cum, f, tot);
+                        return encoder.encode(cum, freqs[i], tot);
                     }
                     cum += freqs[i];
                 }
-                // emit escape
+                // otherwise emit escape
                 encoder.encode(cum, esc, tot)?;
             }
         }
-        // order -1 fallback (uniform)
+        // final fallback at order−1 root (uniform)
         let root = &self.contexts[&Vec::new()];
-        let tot = (root.stats.len() as u32) + 1;
+        let tot0 = (root.stats.len() as u32) + 1;
         if let Some(pos) = root.stats.iter().position(|s| s.symbol == symbol) {
-            encoder.encode(pos as u32, 1, tot)
+            encoder.encode(pos as u32, 1, tot0)
         } else {
-            // final escape (should not normally happen)
-            encoder.encode(root.stats.len() as u32, 1, tot)
+            // one final escape (should never really happen)
+            encoder.encode(root.stats.len() as u32, 1, tot0)
         }
     }
 
-    /// Update model after encoding/decoding `symbol`.
+    /// After emitting symbol, update ALL contexts up to max_order
     fn update_model(&mut self, history: &mut Vec<u8>, symbol: u8) -> PpmResult<()> {
-        let mut updated = false;
-        // back‑off: only the first context containing the symbol is bumped
+        // 1) Lazy‐exclusion update on the longest suffix that contained the symbol
+        let mut bumped = false;
         for i in 0..history.len() {
             let key = history[i..].to_vec();
             if let Some(ctx) = self.contexts.get_mut(&key) {
-                if !updated {
+                if !bumped {
                     ctx.update_exclusion(symbol);
-                    updated = ctx.stats.iter().any(|s| s.symbol == symbol);
+                    bumped = ctx.stats.iter().any(|s| s.symbol == symbol);
                 }
             }
         }
-        // if never seen, insert into root
-        if !updated {
+        // if it never existed, add to the root order‑0
+        if !bumped {
             let root = self.contexts.get_mut(&Vec::new()).unwrap();
             root.stats.push(State { symbol, freq: 1 });
             root.total_freq += 1;
         }
-        // slide window and create new context if needed
+
+        // 2) Slide the history window
         history.push(symbol);
         if history.len() > self.max_order as usize {
             history.remove(0);
         }
-        if !self.contexts.contains_key(history) {
-            let parent_key = if history.len() > 1 {
-                &history[1..]
-            } else {
-                &[]
-            };
-            let mut ctx = PpmContext::new();
-            if let Some(parent) = self.contexts.get(parent_key) {
-                ctx.inherit_from(parent);
+
+        // 3) **Create or inherit** every missing context suffix up to max_order
+        let current_len = history.len();
+        let max_ctx = self.max_order.min(current_len as u8) as usize;
+        for order in 1..=max_ctx {
+            let key = history[current_len - order..].to_vec();
+            if !self.contexts.contains_key(&key) {
+                // build from the (order−1) parent:
+                let parent_key = if key.len() > 1 {
+                    key[1..].to_vec()
+                } else {
+                    Vec::new()
+                };
+                let mut ctx = PpmContext::new();
+                if let Some(parent) = self.contexts.get(&parent_key) {
+                    ctx.inherit_from(parent);
+                }
+                self.contexts.insert(key, ctx);
             }
-            self.contexts.insert(history.clone(), ctx);
         }
+
         Ok(())
     }
 
-    /// Decode one symbol into `out` using `decoder`, updating `history`.
+    /// Decode one byte, write it into `out`, and update the model/history
     pub fn decode_symbol<R: Read>(
         &mut self,
         decoder: &mut RangeDecoder<R>,
         history: &mut Vec<u8>,
-        out: &mut [u8], // should be length 1
+        out: &mut [u8], // length 1
     ) -> PpmResult<()> {
-        // try all contexts
+        // back‑off decode:
         for order in (1..=self.max_order.min(history.len() as u8)).rev() {
             let key = history[history.len() - order as usize..].to_vec();
             if let Some(ctx) = self.contexts.get(&key) {
@@ -309,7 +324,7 @@ impl PpmModel {
                 let threshold = tot.saturating_sub(esc);
                 let r = decoder.get_freq(tot)?;
                 if r < threshold {
-                    // find symbol
+                    // actual symbol
                     let mut cum = 0;
                     for (i, &f) in freqs.iter().enumerate() {
                         if r < cum + f {
@@ -328,7 +343,7 @@ impl PpmModel {
                 }
             }
         }
-        // root fallback
+        // root fallback:
         let root = &self.contexts[&Vec::new()];
         let tot0 = (root.stats.len() as u32) + 1;
         let r0 = decoder.get_freq(tot0)?;
@@ -339,16 +354,16 @@ impl PpmModel {
             self.update_model(history, sym)?;
             Ok(())
         } else {
-            // no more data
+            // end of stream
             decoder.decode(root.stats.len() as u32, 1, tot0)?;
             Err(PpmError::CorruptData)
         }
     }
 }
 
-// File‑based wrappers:
+// File‐based convenience wrappers:
 
-/// Encode file at `input_path` → `output_path`, using `max_order` (default 5).
+/// Compress `input_path` → `output_path`, optional max_order (default 5)
 pub fn encode_file<P: AsRef<Path>, Q: AsRef<Path>>(
     input_path: P,
     output_path: Q,
@@ -361,7 +376,7 @@ pub fn encode_file<P: AsRef<Path>, Q: AsRef<Path>>(
     Ok(())
 }
 
-/// Decode file at `input_path` → `output_path`, assuming `max_order` = 5.
+/// Decompress `input_path` → `output_path`, using default order 5
 pub fn decode_file<P: AsRef<Path>, Q: AsRef<Path>>(input_path: P, output_path: Q) -> PpmResult<()> {
     let input = std::fs::File::open(input_path)?;
     let output = std::fs::File::create(output_path)?;
