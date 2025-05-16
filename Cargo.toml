@@ -6,7 +6,7 @@ license = "Apache-2.0 OR MIT"
 authors = ["winlogon"]
 description = "Pure Rust crate for PPMd compression"
 repository = "https://github.com/walker84837/ppmd-core"
-categories = ["compression", "algorithms", "encoder", "data-structures"]
+categories = ["compression", "algorithms", "data-structures"]
 keywords = ["ppm", "compression", "range-coder", "entropy", "modeling"]
 
 [dependencies]
