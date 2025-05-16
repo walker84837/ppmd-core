@@ -1,42 +1,96 @@
-//! aa
+//! PPMd-style entropy coder for byte streams.
+//!
+//! This crate implements a Prediction by Partial Matching (PPM) compressor/decompressor
+//! using a range encoder/decoder underneath.  PPM builds adaptive probability models
+//! based on the last N bytes of context, where N is the "order."  Higher orders
+//! give better compression at the cost of more memory and CPU; lower orders
+//! run faster but yield larger output.
+//!
+//! # Key Parameters
+//!
+//! - `DEFAULT_ORDER: u8 = 5`  
+//!   The default context length (order-5).  A good middle ground between speed and compression.
+//! - `MAX_FREQ: u8 = 124`  
+//!   Maximum per-symbol frequency in any context.  Caps frequencies to avoid overflow.
+//! - `TOP: u32 = 1 << 24` and `BOT: u32 = 1 << 15`  
+//!   Thresholds used by the underlying range coder to renormalize its internal registers.
+//!   You generally don't need to touch these unless you're tuning the coder itself.
+
 #![forbid(clippy::let_underscore_drop)]
 #![forbid(unsafe_code)]
 #![warn(clippy::unwrap_used)]
 #![warn(missing_docs)]
 
 use std::collections::HashMap;
-use std::convert::AsRef;
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Write};
 use std::path::Path;
 use thiserror::Error as ThisError;
 
-const TOP: u32 = 1 << 24;
-const BOT: u32 = 1 << 15;
-const MAX_FREQ: u8 = 124;
-const DEFAULT_ORDER: u8 = 5;
+pub const TOP: u32 = 1 << 24;
+pub const BOT: u32 = 1 << 15;
+pub const MAX_FREQ: u8 = 124;
+pub const DEFAULT_ORDER: u8 = 5;
 
-///
+/// A specialized `Result` using [`PpmError`] for errors.
 pub type PpmResult<T> = Result<T, PpmError>;
 
+/// The set of errors that can occur during PPM encoding or decoding.
 #[derive(ThisError, Debug)]
-/// ...
 pub enum PpmError {
-    /// ...
+    /// Errors from any underlying I/O operations (file, stream, etc.).
     #[error("IO error: {0}")]
     IoError(#[from] io::Error),
-    /// ...
+
+    /// The input data was unexpectedly corrupt (e.g., decoder sees an impossible symbol).
     #[error("Corrupt input data")]
     CorruptData,
-    /// ...
+
+    /// The decoder was put into an invalid state (should not happen in normal use).
     #[error("Invalid decoder state")]
     InvalidState,
-    /// ...
+
+    /// Errors in the PPM model itself (e.g., invalid parameters).
     #[error("Model error: {0}")]
     ModelError(&'static str),
 }
 
-struct RangeEncoder<W: Write> {
+/// Streaming range‐encoder for arithmetic coding.
+///
+/// The encoder maintains three key internal values:
+/// - `low`: the low end of the current coding interval  
+/// - `range`: the size of the current coding interval  
+/// - `buffer`: a byte buffer (flushed in 4 KB chunks) holding the high‐order output bytes
+///
+/// For each symbol you wish to encode, call [`encode`](#method.encode) with:
+/// 1. `cum_freq`: cumulative frequency of all symbols less than the one you’re encoding  
+/// 2. `freq`: the frequency of the symbol itself  
+/// 3. `tot_freq`: the total of all symbol frequencies in the current context  
+///
+/// After encoding every symbol, call [`finish`](#method.finish) to flush any remaining bytes
+/// and retrieve the underlying writer.
+///
+/// # Example
+///
+/// ```no_run
+/// use std::fs::File;
+/// use ppmd_core::{RangeEncoder, PpmResult};
+///
+/// fn encode_stream() -> PpmResult<()> {
+///     let file = File::create("out.ppm")?;
+///     let mut encoder = RangeEncoder::new(file);
+///
+///     // Suppose `model` yields (cum, freq, tot) triples for each byte:
+///     for (cum, freq, tot) in model.symbols() {
+///         encoder.encode(cum, freq, tot)?;
+///     }
+///
+///     // Finalize and get back the file writer
+///     let _file = encoder.finish()?;
+///     Ok(())
+/// }
+/// ```
+pub struct RangeEncoder<W: Write> {
     low: u32,
     range: u32,
     buffer: Vec<u8>,
@@ -44,7 +98,16 @@ struct RangeEncoder<W: Write> {
 }
 
 impl<W: Write> RangeEncoder<W> {
-    fn new(writer: W) -> Self {
+    /// Create a new range encoder wrapping `writer`.
+    ///
+    /// Initializes:
+    /// - `low = 0`  
+    /// - `range = u32::MAX` (the full 32-bit interval)  
+    /// - an internal 4 KB output buffer  
+    ///
+    /// The encoder will emit one output byte at a time into `buffer`, flushing
+    /// to `writer` whenever the buffer is full.
+    pub fn new(writer: W) -> Self {
         Self {
             low: 0,
             range: u32::MAX,
@@ -90,6 +153,37 @@ impl<W: Write> RangeEncoder<W> {
     }
 }
 
+/// Streaming range‐decoder for arithmetic coding.
+///
+/// The decoder maintains three internal registers:
+/// - `low`: the low end of the current coding interval  
+/// - `code`: the buffered input bits read from the stream  
+/// - `range`: the size of the current coding interval  
+///
+/// On each symbol decode, you first call [`get_freq`] to map the current code
+/// to a frequency within the total frequency range, then call [`decode`]
+/// to narrow the interval and consume bits as needed.
+///
+/// # Example
+///
+/// ```no_run
+/// use std::fs::File;
+/// use ppmd_core::{RangeDecoder, PpmModel, PpmResult};
+///
+/// fn decode_stream() -> PpmResult<()> {
+///     let file = File::open("data.ppm")?;
+///     let mut decoder = RangeDecoder::new(file)?;
+///     let mut model = PpmModel::new(5)?;
+///     let mut history = Vec::new();
+///     let mut out_byte = [0u8; 1];
+///
+///     // Repeatedly call `decode_symbol` until end of stream
+///     while model.decode_symbol(&mut decoder, &mut history, &mut out_byte).is_ok() {
+///         print!("{}", out_byte[0] as char);
+///     }
+///     Ok(())
+/// }
+/// ```
 pub struct RangeDecoder<R: Read> {
     low: u32,
     code: u32,
@@ -99,6 +193,16 @@ pub struct RangeDecoder<R: Read> {
 }
 
 impl<R: Read> RangeDecoder<R> {
+    /// Initialize a new `RangeDecoder` by reading the first 4 bytes
+    /// from `reader` into the internal `code` register.
+    ///
+    /// The range decoder uses these first 32 bits as its starting buffer.
+    /// Subsequent calls to [`get_freq`] and [`decode`] will consume more
+    /// bytes from `reader` as needed to renormalize the interval.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PpmError::IoError` if reading the initial 4-byte code prefix fails.
     pub fn new(mut reader: R) -> PpmResult<Self> {
         let mut code = 0;
         for _ in 0..4 {
@@ -229,12 +333,45 @@ impl PpmContext {
     }
 }
 
+/// The central PPM model.  Maintains up to `max_order` contexts
+/// and dynamically updates symbol frequencies as you encode or decode.
+///
+/// Higher `max_order` (e.g. `Some(8)`) means the model looks at up to 8 previous
+/// bytes for each prediction:  
+/// - **Pros**: Better predictions and higher compression ratio  
+/// - **Cons**: More memory and CPU overhead  
+///
+/// Lower `max_order` (e.g. `None` → default order 5) is faster and lighter,
+/// but compresses less effectively.
+///
+/// # Examples
+///
+/// ```no_run
+/// use ppmd_core::{encode_file, decode_file, PpmResult};
+///
+/// fn main() -> PpmResult<()> {
+///     // Use default order = 5
+///     encode_file("input.bin", "out.ppm", None)?;
+///
+///     // Use a custom order = 8 for potentially better compression
+///     encode_file("input.bin", "out8.ppm", Some(8))?;
+///
+///     // Decode (always uses order 5)
+///     decode_file("out.ppm", "decoded.bin")?;
+///     Ok(())
+/// }
+/// ```
 pub struct PpmModel {
     max_order: u8,
     contexts: HashMap<Vec<u8>, PpmContext>,
 }
 
 impl PpmModel {
+    /// Create a new PPM model with contexts up to `max_order` (1..=16).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `max_order == 0` or `max_order > 16`.
     pub fn new(max_order: u8) -> PpmResult<Self> {
         assert!(
             max_order > 0 && max_order <= 16,
@@ -258,7 +395,8 @@ impl PpmModel {
         Ok(m)
     }
 
-    /// Encode the entire input → output
+    /// Encode the entire contents of `input` into `output`, updating the model
+    /// adaptively as you go.
     pub fn encode<R: Read, W: Write>(&mut self, mut input: R, output: W) -> PpmResult<W> {
         let mut encoder = RangeEncoder::new(output);
         let mut history = Vec::new();
@@ -363,7 +501,10 @@ impl PpmModel {
         Ok(())
     }
 
-    /// Decode one byte, write it into `out`, and update the model/history
+    /// Decode one symbol at a time from `decoder`, writing to `out`,
+    /// and update the model adaptively.
+    ///
+    /// This is used by `decode_file` under the hood.
     pub fn decode_symbol<R: Read>(
         &mut self,
         decoder: &mut RangeDecoder<R>,
@@ -417,8 +558,17 @@ impl PpmModel {
     }
 }
 
-// File‐based convenience wrappers:
-
+/// Compress the file at `input_path` into `output_path` using PPM.
+///  
+/// - `max_order = None` ⇒ uses the crate’s `DEFAULT_ORDER` (5).  
+/// - `max_order = Some(n)` ⇒ uses order n (up to 16).  
+///
+/// By default, we first write an 8-byte little-endian prefix giving the
+/// original file length, then the PPM‐encoded payload.
+///
+/// # Errors
+///
+/// Returns an error if any I/O or encoding step fails.
 pub fn encode_file<P: AsRef<Path>, Q: AsRef<Path>>(
     input_path: P,
     output_path: Q,
@@ -446,7 +596,16 @@ pub fn encode_file<P: AsRef<Path>, Q: AsRef<Path>>(
     Ok(())
 }
 
-/// Decompress `input_path` → `output_path`, using default order 5
+/// Decompress `input_path` (which must have been produced by `encode_file`)
+/// back into `output_path`, using the default `DEFAULT_ORDER = 5`.
+///
+/// Reads the 8-byte length prefix, then decodes exactly that many bytes
+/// via the range decoder + PPM model.
+///
+/// # Errors
+///
+/// Returns an error if any I/O or decoding step fails, or if the input
+/// is corrupt.
 pub fn decode_file<P: AsRef<Path>, Q: AsRef<Path>>(input_path: P, output_path: Q) -> PpmResult<()> {
     let input_path = input_path.as_ref();
     let output_path = output_path.as_ref();
