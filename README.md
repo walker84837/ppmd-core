@@ -3,7 +3,7 @@
 [![Rust](https://github.com/walker84837/ppmd-core/actions/workflows/rust.yml/badge.svg)](https://github.com/walker84837/ppmd-core/actions/workflows/rust.yml)
 
 A pure-Rust implementation of the PPMd (Prediction by Partial Matching, variant D) compressor with an underlying range coder.  
-Designed for simplicity, safety (no `unsafe`), and zero-dependency entropy coding in your Rust projects.
+Designed for safety (no `unsafe`), and zero-dependency entropy coding in your Rust projects.
 
 ## Features
 
@@ -11,7 +11,7 @@ Designed for simplicity, safety (no `unsafe`), and zero-dependency entropy codin
 - Adaptive frequency tables with escape mechanism
 - High-speed range encoder/decoder
 - Configurable context order: trade CPU/memory vs. compression ratio
-- Safe Rust only (no `#![forbid(unsafe_code)]`), no extra dependencies
+- Safe Rust only (`#![forbid(unsafe_code)]`)
 
 ## Quick Start
 
