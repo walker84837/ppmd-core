@@ -1,3 +1,7 @@
+#[forbid(clippy::let_underscore_drop)]
+#[forbid(unsafe_code)]
+#[warn(clippy::unwrap_used)]
+#[warn(missing_docs)]
 use std::collections::HashMap;
 use std::convert::AsRef;
 use std::fs::File;
@@ -42,7 +46,11 @@ impl<W: Write> RangeEncoder<W> {
     }
 
     fn encode(&mut self, cum_freq: u32, freq: u32, tot_freq: u32) -> PpmResult<()> {
-        // tot_freq is now guaranteed > 0
+        assert!(tot_freq > 0, "total frequency must be positive");
+        assert!(freq > 0, "symbol frequency must be positive");
+        assert!(cum_freq < tot_freq, "cumulative freq out of range");
+        assert!(cum_freq + freq <= tot_freq, "freq interval exceeds total");
+
         self.range /= tot_freq;
         self.low = self.low.wrapping_add(cum_freq * self.range);
         self.range = self.range.wrapping_mul(freq);
@@ -63,10 +71,12 @@ impl<W: Write> RangeEncoder<W> {
     }
 
     fn finish(mut self) -> PpmResult<W> {
+        assert!(self.range > 0, "range became zero in finish");
         for _ in 0..4 {
             self.buffer.push((self.low >> 24) as u8);
             self.low <<= 8;
         }
+        assert!(!self.buffer.is_empty(), "nothing to flush in finish");
         self.writer.write_all(&self.buffer)?;
         Ok(self.writer)
     }
@@ -98,7 +108,7 @@ impl<R: Read> RangeDecoder<R> {
     }
 
     pub fn get_freq(&mut self, tot_freq: u32) -> PpmResult<u32> {
-        // tot_freq > 0
+        assert!(tot_freq > 0, "total frequency must be positive");
         self.range /= tot_freq;
         let tmp = (self.code.wrapping_sub(self.low)) / self.range;
         if tmp >= tot_freq {
@@ -108,6 +118,10 @@ impl<R: Read> RangeDecoder<R> {
     }
 
     pub fn decode(&mut self, cum_freq: u32, freq: u32, tot_freq: u32) -> PpmResult<()> {
+        assert!(freq > 0, "frequency must be positive");
+        assert!(cum_freq < tot_freq, "cumulative freq out of range");
+        assert!(cum_freq + freq <= tot_freq, "freq interval exceeds total");
+
         if cum_freq.wrapping_add(freq) > tot_freq {
             return Err(PpmError::CorruptData);
         }
@@ -146,17 +160,26 @@ impl PpmContext {
         }
     }
 
-    /// PPMII “information inheritance”:
+    /// PPMII "information inheritance":
     /// copy each parent frequency as max(1, parent.freq/2)
     fn inherit_from(&mut self, parent: &PpmContext) {
+        // parents stats should be non‐empty if called in contexts
+        assert!(parent.stats.len() > 0, "parent context has no stats");
+
         self.stats.clear();
         for st in &parent.stats {
+            let f = (st.freq / 2).max(1);
+            assert!(f >= 1, "inherited frequency dropped below 1");
             self.stats.push(State {
                 symbol: st.symbol,
-                freq: (st.freq / 2).max(1),
+                freq: f,
             });
         }
         self.total_freq = self.stats.iter().map(|s| s.freq as u32).sum();
+        assert!(
+            self.total_freq > 0,
+            "total_freq must be positive after inherit"
+        );
     }
 
     /// PPMD escape probabilities:
@@ -164,14 +187,18 @@ impl PpmContext {
     ///   escape = q  (number of distinct symbols)
     ///   tot    = 2·C
     fn get_cumulative(&self) -> (Vec<u8>, Vec<u32>, u32, u32) {
-        let C: u32 = self.stats.iter().map(|s| s.freq as u32).sum();
+        let c: u32 = self.stats.iter().map(|s| s.freq as u32).sum();
         let q = self.stats.len() as u32;
-        let tot = 2 * C;
+        let tot = 2 * c;
+        assert!(tot > 0, "total (2*C) must be positive");
+
         let mut syms = Vec::with_capacity(self.stats.len());
         let mut freqs = Vec::with_capacity(self.stats.len());
         for st in &self.stats {
+            let f = 2 * (st.freq as u32).saturating_sub(1);
+            assert!(f > 0, "computed symbol frequency must be positive");
             syms.push(st.symbol);
-            freqs.push(2 * (st.freq as u32).saturating_sub(1));
+            freqs.push(f);
         }
         (syms, freqs, q, tot)
     }
@@ -179,9 +206,17 @@ impl PpmContext {
     /// Lazy exclusion: bump only the first (highest-order) context
     /// that actually contained the symbol.
     fn update_exclusion(&mut self, symbol: u8) {
+        let before = self.total_freq;
         if let Some(st) = self.stats.iter_mut().find(|s| s.symbol == symbol) {
-            st.freq = st.freq.saturating_add(1).min(MAX_FREQ);
+            let new_freq = st.freq.saturating_add(1).min(MAX_FREQ);
+            assert!(new_freq >= st.freq, "freq must not decrease on bump");
+
+            st.freq = new_freq;
             self.total_freq = self.stats.iter().map(|s| s.freq as u32).sum();
+            assert!(
+                self.total_freq >= before,
+                "total_freq must not shrink after update"
+            );
         }
     }
 }
@@ -193,9 +228,10 @@ pub struct PpmModel {
 
 impl PpmModel {
     pub fn new(max_order: u8) -> PpmResult<Self> {
-        if max_order == 0 || max_order > 16 {
-            return Err(PpmError::ModelError("Invalid max order"));
-        }
+        assert!(
+            max_order > 0 && max_order <= 16,
+            "max_order out of valid range"
+        );
         let mut m = PpmModel {
             max_order,
             contexts: HashMap::new(),
@@ -209,6 +245,7 @@ impl PpmModel {
             });
         }
         root.total_freq = 256;
+        assert_eq!(root.stats.len(), 256, "root must contain all 256 symbols");
         m.contexts.insert(Vec::new(), root);
         Ok(m)
     }
@@ -233,6 +270,8 @@ impl PpmModel {
         history: &[u8],
         symbol: u8,
     ) -> PpmResult<()> {
+        assert!(history.len() <= self.max_order as usize, "history too long");
+
         // back‑off from highest order down to order−1:
         for order in (1..=self.max_order.min(history.len() as u8)).rev() {
             let key = history[history.len() - order as usize..].to_vec();
@@ -263,7 +302,8 @@ impl PpmModel {
 
     /// After emitting symbol, update ALL contexts up to max_order
     fn update_model(&mut self, history: &mut Vec<u8>, symbol: u8) -> PpmResult<()> {
-        // 1) Lazy‐exclusion update on the longest suffix that contained the symbol
+        let before = self.contexts.len();
+        // lazy‐exclusion update on the longest suffix that contained the symbol
         let mut bumped = false;
         for i in 0..history.len() {
             let key = history[i..].to_vec();
@@ -281,13 +321,14 @@ impl PpmModel {
             root.total_freq += 1;
         }
 
-        // 2) Slide the history window
+        // Slide the history window
         history.push(symbol);
         if history.len() > self.max_order as usize {
             history.remove(0);
         }
+        assert!(self.contexts.len() >= before, "contexts should not shrink");
 
-        // 3) **Create or inherit** every missing context suffix up to max_order
+        // Create or inherit every missing context suffix up to max_order
         let current_len = history.len();
         let max_ctx = self.max_order.min(current_len as u8) as usize;
         for order in 1..=max_ctx {
@@ -307,6 +348,10 @@ impl PpmModel {
             }
         }
 
+        assert!(
+            history.len() <= self.max_order as usize,
+            "history exceeded max_order"
+        );
         Ok(())
     }
 
@@ -315,8 +360,9 @@ impl PpmModel {
         &mut self,
         decoder: &mut RangeDecoder<R>,
         history: &mut Vec<u8>,
-        out: &mut [u8], // length 1
+        out: &mut [u8],
     ) -> PpmResult<()> {
+        assert!(out.len() == 1, "output buffer must be exactly one byte");
         // back‑off decode:
         for order in (1..=self.max_order.min(history.len() as u8)).rev() {
             let key = history[history.len() - order as usize..].to_vec();
@@ -344,6 +390,7 @@ impl PpmModel {
                 }
             }
         }
+
         // root fallback:
         let root = &self.contexts[&Vec::new()];
         let tot0 = (root.stats.len() as u32) + 1;
@@ -418,3 +465,5 @@ pub fn decode_file<P: AsRef<Path>, Q: AsRef<Path>>(input_path: P, output_path: Q
 
     Ok(())
 }
+
+
