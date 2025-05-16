@@ -1,7 +1,9 @@
-#[forbid(clippy::let_underscore_drop)]
-#[forbid(unsafe_code)]
-#[warn(clippy::unwrap_used)]
-#[warn(missing_docs)]
+//! aa
+#![forbid(clippy::let_underscore_drop)]
+#![forbid(unsafe_code)]
+#![warn(clippy::unwrap_used)]
+#![warn(missing_docs)]
+
 use std::collections::HashMap;
 use std::convert::AsRef;
 use std::fs::File;
@@ -14,16 +16,22 @@ const BOT: u32 = 1 << 15;
 const MAX_FREQ: u8 = 124;
 const DEFAULT_ORDER: u8 = 5;
 
+///
 pub type PpmResult<T> = Result<T, PpmError>;
 
 #[derive(ThisError, Debug)]
+/// ...
 pub enum PpmError {
+    /// ...
     #[error("IO error: {0}")]
     IoError(#[from] io::Error),
+    /// ...
     #[error("Corrupt input data")]
     CorruptData,
+    /// ...
     #[error("Invalid decoder state")]
     InvalidState,
+    /// ...
     #[error("Model error: {0}")]
     ModelError(&'static str),
 }
@@ -107,7 +115,7 @@ impl<R: Read> RangeDecoder<R> {
         })
     }
 
-    pub fn get_freq(&mut self, tot_freq: u32) -> PpmResult<u32> {
+    fn get_freq(&mut self, tot_freq: u32) -> PpmResult<u32> {
         assert!(tot_freq > 0, "total frequency must be positive");
         self.range /= tot_freq;
         let tmp = (self.code.wrapping_sub(self.low)) / self.range;
@@ -117,7 +125,7 @@ impl<R: Read> RangeDecoder<R> {
         Ok(tmp)
     }
 
-    pub fn decode(&mut self, cum_freq: u32, freq: u32, tot_freq: u32) -> PpmResult<()> {
+    fn decode(&mut self, cum_freq: u32, freq: u32, tot_freq: u32) -> PpmResult<()> {
         assert!(freq > 0, "frequency must be positive");
         assert!(cum_freq < tot_freq, "cumulative freq out of range");
         assert!(cum_freq + freq <= tot_freq, "freq interval exceeds total");
@@ -195,7 +203,7 @@ impl PpmContext {
         let mut syms = Vec::with_capacity(self.stats.len());
         let mut freqs = Vec::with_capacity(self.stats.len());
         for st in &self.stats {
-            let f = 2 * (st.freq as u32).saturating_sub(1);
+            let f = (st.freq as u32) * 2 - 1;
             assert!(f > 0, "computed symbol frequency must be positive");
             syms.push(st.symbol);
             freqs.push(f);
@@ -456,14 +464,10 @@ pub fn decode_file<P: AsRef<Path>, Q: AsRef<Path>>(input_path: P, output_path: Q
     let mut buf = [0u8; 1];
     let mut actual = 0;
     while actual < expected {
-        println!("decoding byte {}/{}", actual, expected);
         model.decode_symbol(&mut decoder, &mut history, &mut buf)?;
-        println!("decoded {:02x}", buf[0]);
         writer.write_all(&buf)?;
         actual += 1;
     }
 
     Ok(())
 }
-
-
