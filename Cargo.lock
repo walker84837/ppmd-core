@@ -3,7 +3,7 @@
 version = 4
 
 [[package]]
-name = "ppmd-rs"
+name = "ppmd-core"
 version = "0.1.0"
 dependencies = [
  "thiserror",

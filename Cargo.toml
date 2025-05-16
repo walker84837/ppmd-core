@@ -1,7 +1,13 @@
 [package]
-name = "ppmd-rs"
+name = "ppmd-core"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0 OR MIT"
+authors = ["winlogon"]
+description = "Pure Rust crate for PPMd compression"
+repository = "https://github.com/walker84837/ppmd-core"
+categories = ["compression", "algorithms", "encoder", "data-structures"]
+keywords = ["ppm", "compression", "range-coder", "entropy", "modeling"]
 
 [dependencies]
 thiserror = "2.0.12"
